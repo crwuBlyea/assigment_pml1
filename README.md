@@ -1,115 +1,836 @@
-PMLDL Assignment 1 – Deployment
-An automated, three-stage MLOps pipeline that runs every 5 minutes:
+# PMLDL Assignment 1 — MLOps Pipeline
 
-Stage	What happens	Tools
-1 · Data engineering	load → clean (impute missing values, remove outliers) → stratified 80/20 split	pandas, scikit-learn
-2 · Model engineering	feature scaling, training of 2 candidate models, evaluation, logging, packaging	scikit-learn, MLflow, joblib
-3 · Deployment	build & run a model API + web app in separate Docker containers	Docker, FastAPI, Streamlit
-Dataset: Pima Indians Diabetes (UCI) — 768 patients, 8 features, binary target Outcome.
+An automated MLOps pipeline for training and deploying a diabetes prediction model.
 
-Architecture
-                 ┌──────────────────────────────────────────────┐                 │  scheduler.py  (every 5 min, APScheduler)    │                 └───────────────────────┬──────────────────────┘                                         ▼       ┌────────────────────────── run_pipeline.py ──────────────────────────┐       ▼                                                                      ▼┌──────────────────┐   ┌──────────────────────┐   ┌────────────────────────────────┐│ Stage 1: data    │   │ Stage 2: model       │   │ Stage 3: deployment            ││ prepare_data.py  │ → │ train_model.py       │ → │ docker compose up -d --build   ││ load/clean/split │   │ features/train/eval/ │   │  • api  (FastAPI)   :8000      │└──────────────────┘   │ package  + MLflow    │   │  • app  (Streamlit) :8501      │                       └──────────────────────┘   └────────────────────────────────┘data/raw/diabetes.csv → data/processed/{train,test}.csv → models/{model.joblib, metrics.json}                                                            │ bind mount + hot-reload                                                            ▼                                             app ── POST /predict ──► api ──► model
-Repository structure
-.├── README.md├── requirements.txt          # host-side dependencies (Stages 1–2, scheduler)├── run_pipeline.py           # runs all three stages once├── scheduler.py              # runs the pipeline every 5 minutes├── code/│   ├── __init__.py           # ⚠ must exist (empty!) — see Troubleshooting│   ├── datasets/│   │   ├── __init__.py       # ⚠ must exist (empty!)│   │   ├── download_data.py  # Stage 0: fetch raw dataset (synthetic fallback offline)│   │   └── prepare_data.py   # Stage 1│   ├── models/│   │   ├── __init__.py       # ⚠ must exist (empty!)│   │   ├── build_features.py│   │   └── train_model.py    # Stage 2│   └── deployment/│       ├── docker-compose.yml        # Stage 3│       ├── api/│       │   ├── Dockerfile│       │   ├── requirements.txt│       │   └── main.py               # FastAPI model API│       └── app/│           ├── Dockerfile│           ├── requirements.txt│           └── streamlit_app.py      # web application├── data/│   ├── raw/                  # diabetes.csv (auto-downloaded by Stage 0)│   └── processed/            # train.csv / test.csv (Stage 1 output, gitignored)├── models/                   # model.joblib + metrics.json (Stage 2 output, gitignored)├── mlruns/                   # MLflow tracking data (gitignored)└── notebooks/
-Prerequisites
-Requirement	Notes
-Python 3.9–3.12	check with python --version
-Docker Desktop	installed and running (green icon in tray) — required for Stage 3
-Quickstart
-Run all commands from the repository root.
+The pipeline processes the **Pima Indians Diabetes dataset**, trains two machine-learning models, tracks experiments with **MLflow**, and deploys the selected model through a **FastAPI** service and a **Streamlit** web application.
 
-Clone and set up the environment:
-git clone <your-repo-url>cd <repo>python -m venv venvvenv\Scripts\activate            # Windows (cmd / PowerShell)# source venv/bin/activate       # Linux / macOSpip install -r requirements.txt
-Run the complete pipeline once (raw data is downloaded automatically if missing):
+The complete pipeline can also be executed automatically every **5 minutes**.
+
+---
+
+## Overview
+
+The project consists of four main stages:
+
+| Stage                    | Description                                                     | Tools                        |
+| ------------------------ | --------------------------------------------------------------- | ---------------------------- |
+| **0. Data acquisition**  | Download the dataset or generate an offline fallback            | Python                       |
+| **1. Data engineering**  | Clean the data and create train/test splits                     | pandas, scikit-learn         |
+| **2. Model engineering** | Engineer features, train and evaluate models, track experiments | scikit-learn, MLflow, joblib |
+| **3. Deployment**        | Run the trained model as an API and provide a web interface     | Docker, FastAPI, Streamlit   |
+
+### Dataset
+
+The project uses the **Pima Indians Diabetes dataset**:
+
+* 768 patients
+* 8 input features
+* Binary target: `Outcome`
+
+---
+
+## Architecture
+
+```text
+                         ┌──────────────────────────┐
+                         │      scheduler.py        │
+                         │       Every 5 minutes    │
+                         └────────────┬─────────────┘
+                                      │
+                                      ▼
+                         ┌──────────────────────────┐
+                         │     run_pipeline.py      │
+                         └────────────┬─────────────┘
+                                      │
+                 ┌────────────────────┼────────────────────┐
+                 │                    │                    │
+                 ▼                    ▼                    ▼
+        ┌─────────────────┐  ┌─────────────────┐  ┌────────────────────┐
+        │ Stage 0         │  │ Stage 1         │  │ Stage 2            │
+        │ Data acquisition│  │ Data engineering│  │ Model engineering  │
+        │                 │  │                 │  │                    │
+        │ download_data.py│  │ prepare_data.py │  │ build_features.py  │
+        └────────┬────────┘  └────────┬────────┘  │ train_model.py     │
+                 │                    │           └─────────┬──────────┘
+                 ▼                    ▼                     │
+        data/raw/             data/processed/              ▼
+        diabetes.csv          train.csv/test.csv    models/model.joblib
+                                                         │
+                                                         ▼
+                                             ┌───────────────────────┐
+                                             │ Stage 3               │
+                                             │ Docker deployment     │
+                                             └───────────┬───────────┘
+                                                         │
+                                  ┌──────────────────────┴──────────────────┐
+                                  │                                         │
+                                  ▼                                         ▼
+                         ┌─────────────────┐                       ┌─────────────────┐
+                         │ FastAPI API     │                       │ Streamlit App   │
+                         │ Port 8000       │◄──────────────────────│ Port 8501       │
+                         └─────────────────┘                       └─────────────────┘
+```
+
+The Streamlit application sends prediction requests to the FastAPI service:
+
+```text
+Streamlit → POST /predict → FastAPI → model.joblib → prediction
+```
+
+---
+
+## Repository Structure
+
+```text
+.
+├── README.md
+├── requirements.txt
+├── run_pipeline.py
+├── scheduler.py
+│
+├── code/
+│   ├── __init__.py
+│   │
+│   ├── datasets/
+│   │   ├── __init__.py
+│   │   ├── download_data.py
+│   │   └── prepare_data.py
+│   │
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── build_features.py
+│   │   └── train_model.py
+│   │
+│   └── deployment/
+│       ├── docker-compose.yml
+│       │
+│       ├── api/
+│       │   ├── Dockerfile
+│       │   ├── requirements.txt
+│       │   └── main.py
+│       │
+│       └── app/
+│           ├── Dockerfile
+│           ├── requirements.txt
+│           └── streamlit_app.py
+│
+├── data/
+│   ├── raw/
+│   │   └── diabetes.csv
+│   └── processed/
+│       ├── train.csv
+│       └── test.csv
+│
+├── models/
+│   ├── model.joblib
+│   └── metrics.json
+│
+├── mlruns/
+│
+└── notebooks/
+```
+
+The following directories are generated by the pipeline and are normally gitignored:
+
+```text
+data/processed/
+models/
+mlruns/
+```
+
+---
+
+# Requirements
+
+## Software
+
+* Python **3.9–3.12**
+* Docker Desktop
+* Git
+
+Check your Python version:
+
+```bash
+python --version
+```
+
+Docker Desktop must be installed and running before starting the deployment stage.
+
+---
+
+# Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/crwuBlyea/assigment_pml1.git
+cd assigment_pml1
+```
+
+Create a virtual environment:
+
+### Windows
+
+```cmd
+python -m venv venv
+venv\Scripts\activate
+```
+
+### Linux / macOS
+
+```bash
+python -m venv venv
+source venv/bin/activate
+```
+
+Install the dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+# Quick Start
+
+Run the complete pipeline once:
+
+```bash
 python run_pipeline.py
-Automate — run the complete pipeline every 5 minutes:
+```
+
+The pipeline will:
+
+1. Download the raw dataset if it is missing.
+2. Clean and split the dataset.
+3. Train the candidate models.
+4. Evaluate the models.
+5. Log the experiments to MLflow.
+6. Save the selected model.
+7. Build and start the Docker containers.
+
+After the pipeline finishes, the services should be available at:
+
+| Service               | URL                              |
+| --------------------- | -------------------------------- |
+| Streamlit application | http://localhost:8501            |
+| FastAPI Swagger UI    | http://localhost:8000/docs       |
+| API health check      | http://localhost:8000/health     |
+| Model information     | http://localhost:8000/model_info |
+
+---
+
+# Running the Pipeline Automatically
+
+To run the pipeline every **5 minutes**:
+
+```bash
 python scheduler.py
-Where to look after launch
-Service	URL
-Streamlit app (input fields → Predict → prediction)	http://localhost:8501
-Model API (Swagger docs)	http://localhost:8000/docs
-Model API health	http://localhost:8000/health
-Latest training metrics	http://localhost:8000/model_info
-Running containers	docker ps (diabetes-api, diabetes-app)
-MLflow UI (optional; on MLflow ≥ 3.1 the env variable is required — see MLflow 3.x notes):
+```
 
-:: Windows (cmd)set MLFLOW_ALLOW_FILE_STORE=truemlflow ui --port 5000
-# Windows (PowerShell) $env:MLFLOW_ALLOW_FILE_STORE = "true"mlflow ui --port 5000
-# Linux / macOSexport MLFLOW_ALLOW_FILE_STORE=truemlflow ui --port 5000
-Then open http://localhost:5000.
+The scheduler:
 
-Stop everything: Ctrl+C (scheduler) and
+* Runs the pipeline immediately when started.
+* Runs it again every 5 minutes.
+* Prevents overlapping pipeline executions.
+* Logs failed runs without stopping the scheduler.
 
+You can verify that automation is working by checking:
+
+* New MLflow runs appearing every 5 minutes.
+* `models/metrics.json` receiving an updated `trained_at` timestamp.
+* Both Docker containers remaining active.
+
+---
+
+# Pipeline Stages
+
+## Stage 0 — Data Acquisition
+
+**File:**
+
+```text
+code/datasets/download_data.py
+```
+
+The script downloads the raw dataset to:
+
+```text
+data/raw/diabetes.csv
+```
+
+If there is no internet connection, a synthetic dataset with the same schema is generated instead.
+
+This allows the pipeline to run even when the original dataset cannot be downloaded.
+
+---
+
+## Stage 1 — Data Engineering
+
+**File:**
+
+```text
+code/datasets/prepare_data.py
+```
+
+The preparation stage performs the following operations.
+
+### 1. Load the dataset
+
+```text
+data/raw/diabetes.csv
+```
+
+### 2. Handle invalid zero values
+
+The following features cannot physiologically have a value of zero:
+
+* `Glucose`
+* `BloodPressure`
+* `SkinThickness`
+* `Insulin`
+* `BMI`
+
+Zero values are therefore replaced with `NaN` and imputed using the corresponding column median.
+
+### 3. Remove outliers
+
+Rows outside:
+
+```text
+1.5 × IQR
+```
+
+are removed for the feature columns.
+
+> **Note:** Applying the IQR rule to all 8 features removes a substantial number of rows because some features in the Pima dataset have heavy-tailed distributions, particularly `Insulin` and `DiabetesPedigreeFunction`.
+
+### 4. Split the dataset
+
+The cleaned data is divided using a stratified **80/20 train/test split**.
+
+Output:
+
+```text
+data/processed/train.csv
+data/processed/test.csv
+```
+
+---
+
+# Stage 2 — Model Engineering
+
+**Directory:**
+
+```text
+code/models/
+```
+
+The model stage performs feature engineering, training, evaluation, and model packaging.
+
+## Feature scaling
+
+A `StandardScaler` is used inside a scikit-learn `Pipeline`.
+
+The scaler is fitted only on the training data to prevent data leakage.
+
+The same fitted pipeline is then used during:
+
+* Testing
+* Model serving
+
+---
+
+## Models
+
+Two models are trained:
+
+### Logistic Regression
+
+```text
+LogisticRegression
+```
+
+### Random Forest
+
+```text
+RandomForestClassifier
+```
+
+Both models are evaluated on the test dataset.
+
+The following metrics are calculated:
+
+* Accuracy
+* Precision
+* Recall
+* F1 score
+* ROC-AUC
+
+---
+
+## MLflow
+
+Each model is logged to MLflow together with:
+
+* Parameters
+* Evaluation metrics
+* The trained model
+
+MLflow tracking data is stored in:
+
+```text
+mlruns/
+```
+
+The model with the best **F1 score** is selected for deployment.
+
+The selected model is saved as:
+
+```text
+models/model.joblib
+```
+
+Test metrics are saved to:
+
+```text
+models/metrics.json
+```
+
+The model file is replaced atomically so that the running API does not read a partially written model.
+
+---
+
+# Stage 3 — Deployment
+
+**Directory:**
+
+```text
+code/deployment/
+```
+
+Docker Compose starts two separate containers.
+
+## API
+
+The API uses **FastAPI**.
+
+Container:
+
+```text
+diabetes-api
+```
+
+Port:
+
+```text
+8000
+```
+
+Available endpoints:
+
+```text
+POST /predict
+GET  /health
+GET  /model_info
+```
+
+The `models/` directory is bind-mounted into the container.
+
+The API automatically reloads the model when `model.joblib` changes. This means that a newly trained model can be picked up without restarting the container.
+
+---
+
+## Web Application
+
+The web application uses **Streamlit**.
+
+Container:
+
+```text
+diabetes-app
+```
+
+Port:
+
+```text
+8501
+```
+
+The application provides input fields for all 8 features and a **Predict** button.
+
+The prediction returned by the API includes:
+
+* Predicted class
+* Human-readable label
+* Probability of diabetes
+
+The Streamlit application communicates with the API through the Docker Compose network:
+
+```text
+http://api:8000/predict
+```
+
+---
+
+# API Usage
+
+## Swagger UI
+
+The easiest way to test the API is through Swagger:
+
+```text
+http://localhost:8000/docs
+```
+
+Open:
+
+```text
+POST /predict
+```
+
+Then click:
+
+```text
+Try it out
+```
+
+and provide the input data.
+
+---
+
+## cURL Example
+
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "Pregnancies": 6,
+    "Glucose": 148,
+    "BloodPressure": 72,
+    "SkinThickness": 35,
+    "Insulin": 0,
+    "BMI": 33.6,
+    "DiabetesPedigreeFunction": 0.627,
+    "Age": 50
+  }'
+```
+
+Example response:
+
+```json
+{
+  "prediction": 1,
+  "label": "diabetic",
+  "probability_diabetes": 0.83
+}
+```
+
+---
+
+# Running Individual Stages
+
+Each stage can also be executed separately.
+
+## Stage 0
+
+```bash
+python -m code.datasets.download_data
+```
+
+## Stage 1
+
+```bash
+python -m code.datasets.prepare_data
+```
+
+## Stage 2
+
+```bash
+python -m code.models.train_model
+```
+
+## Stage 3
+
+```bash
+docker compose -f code/deployment/docker-compose.yml up -d --build
+```
+
+The `run_pipeline.py` script executes these stages in the correct order.
+
+---
+
+# MLflow
+
+MLflow stores experiment tracking information in:
+
+```text
+mlruns/
+```
+
+To start the MLflow UI:
+
+### Windows — Command Prompt
+
+```cmd
+set MLFLOW_ALLOW_FILE_STORE=true
+mlflow ui --port 5000
+```
+
+### Windows — PowerShell
+
+```powershell
+$env:MLFLOW_ALLOW_FILE_STORE = "true"
+mlflow ui --port 5000
+```
+
+### Linux / macOS
+
+```bash
+export MLFLOW_ALLOW_FILE_STORE=true
+mlflow ui --port 5000
+```
+
+Then open:
+
+```text
+http://localhost:5000
+```
+
+---
+
+# MLflow 3.x Compatibility
+
+The project supports both **MLflow 2.x and 3.x**.
+
+## Filesystem tracking
+
+MLflow 3.1 and newer restrict filesystem tracking by default.
+
+`train_model.py` already sets:
+
+```text
+MLFLOW_ALLOW_FILE_STORE=true
+```
+
+When starting the MLflow UI manually, the same environment variable must be set.
+
+---
+
+## Random Forest and skops
+
+MLflow 3.x uses `skops` for scikit-learn model serialization.
+
+Random Forest models contain:
+
+```text
+sklearn.tree._tree.Tree
+```
+
+which can be detected as an untrusted type.
+
+The project explicitly allows this type when logging the model because the model is trained locally by this pipeline:
+
+```text
+skops_trusted_types=["sklearn.tree._tree.Tree"]
+```
+
+---
+
+# Stopping the Services
+
+Stop the scheduler with:
+
+```text
+Ctrl+C
+```
+
+Stop the Docker containers with:
+
+```bash
 docker compose -f code/deployment/docker-compose.yml down
-Running the stages individually
-python -m code.datasets.download_datapython -m code.datasets.prepare_datapython -m code.models.train_modeldocker compose -f code/deployment/docker-compose.yml up -d --build
-run_pipeline.py runs exactly these commands in this order.
+```
 
-Pipeline stages
-Stage 0 – Data acquisition (code/datasets/download_data.py)
-Downloads the raw CSV to data/raw/diabetes.csv. If there is no internet access, a synthetic dataset with the same schema is generated, so the pipeline can always be demonstrated.
+You can check running containers with:
 
-Stage 1 – Data engineering (code/datasets/prepare_data.py)
-loads data/raw/diabetes.csv;
-cleaning: zeros in Glucose, BloodPressure, SkinThickness, Insulin, BMI are physiologically impossible → replaced with NaN and imputed with the column median; rows outside 1.5·IQR in any feature are removed as outliers;
-stratified 80/20 split → data/processed/train.csv, data/processed/test.csv.
-Note: applying the IQR rule to all 8 features removes a substantial share of rows (the Pima dataset has heavy tails in Insulin and DiabetesPedigreeFunction) — this is acceptable for this assignment.
+```bash
+docker ps
+```
 
-Stage 2 – Model engineering (code/models/)
-feature engineering: StandardScaler inside a sklearn Pipeline fitted on the training data only (no leakage) and reused for evaluation and serving;
-trains LogisticRegression and RandomForestClassifier; evaluates accuracy / precision / recall / F1 / ROC-AUC on the test set;
-logs params, metrics and each model to MLflow (mlruns/);
-packages the best model (by F1) into models/model.joblib (atomic file replace) and writes the test metrics to models/metrics.json.
-Stage 3 – Deployment (code/deployment/)
-docker-compose.yml builds and starts two separate containers:
+Expected containers:
 
-api (FastAPI): POST /predict, GET /health, GET /model_info.The host folder models/ is bind-mounted into the container, and the API hot-reloads the model whenever model.joblib changes — every 5-minute retrain is picked up without restarting the container.
-app (Streamlit): input fields for the 8 features, a Predict button, and a prediction area showing the label + probability returned by the API (calls http://api:8000/predict over the compose network).
-API example
-curl -X POST http://localhost:8000/predict \  -H "Content-Type: application/json" \  -d '{"Pregnancies": 6, "Glucose": 148, "BloodPressure": 72, "SkinThickness": 35,       "Insulin": 0, "BMI": 33.6, "DiabetesPedigreeFunction": 0.627, "Age": 50}'# → {"prediction": 1, "label": "diabetic", "probability_diabetes": 0.83}
-On Windows, the easiest way to test the API is the Swagger UI: http://localhost:8000/docs → POST /predict → Try it out.
+```text
+diabetes-api
+diabetes-app
+```
 
-Automation
-scheduler.py (APScheduler, interval trigger, max_instances=1):
+---
 
-runs the full pipeline immediately on startup and then every 5 minutes;
-a failing run is logged but does not stop the scheduler;
-overlapping runs are prevented (max_instances=1).
-How to verify automation: every 5 minutes new runs appear in the MLflow UI, models/metrics.json gets a fresh trained_at timestamp, and docker ps keeps showing both containers.
+# Automation with cron
 
-Alternative: cron — */5 * * * * cd /path/to/repo && ./venv/bin/python run_pipeline.py >> pipeline.log 2>&1
+Instead of `scheduler.py`, the pipeline can also be triggered using cron:
 
-MLflow 3.x compatibility notes
-The code works with both MLflow 2.x and 3.x. Two 3.x specifics are already handled inside code/models/train_model.py:
+```cron
+*/5 * * * * cd /path/to/repo && ./venv/bin/python run_pipeline.py >> pipeline.log 2>&1
+```
 
-Filesystem tracking backend (./mlruns) is blocked by default in MLflow ≥ 3.1.train_model.py sets os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true") at the top, so the pipeline works out of the box. When starting the MLflow UI, set the same variable yourself (commands above).
-skops security check. MLflow 3.x saves sklearn models via skops, which blocks sklearn.tree._tree.Tree (RandomForest internals) as an "untrusted type". Since the model is trained locally by this very pipeline, the code passes skops_trusted_types=["sklearn.tree._tree.Tree"] to mlflow.sklearn.log_model.
-Troubleshooting
-Error message	Fix
-No module named 'code.datasets'; 'code' is not a package	__init__.py files are missing — without them Python imports the stdlib code module instead of the code/ folder. Create three empty files (commands below).
-ModuleNotFoundError: No module named 'pandas' (or sklearn / mlflow)	venv not activated or dependencies not installed: activate venv → pip install -r requirements.txt
-MlflowException: ... filesystem tracking backend ... is in maintenance mode	Already fixed in train_model.py; for mlflow ui set MLFLOW_ALLOW_FILE_STORE=true
-Untrusted types found ... ['sklearn.tree._tree.Tree']	Already fixed in train_model.py (skops_trusted_types)
-RuntimeError: Docker Compose not found	Install Docker Desktop and make sure it is running
-Bind for 0.0.0.0:8000 failed: port is already allocated	Ports 8000 / 8501 are busy → change the left side of the mapping in code/deployment/docker-compose.yml (e.g. "8080:8000"); API_URL needs no change (internal compose network)
-...running scripts is disabled (venv activation in PowerShell)	Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-can't open file 'run_pipeline.py': [Errno 2]	Wrong folder (run from repo root) or the file is actually run_pipeline.py.txt (enable extension display in Explorer)
-Creating the __init__.py files:
+This runs the pipeline every 5 minutes.
 
-# Linux / macOStouch code/__init__.py code/datasets/__init__.py code/models/__init__.py
-:: Windows (cmd)type nul > code\__init__.pytype nul > code\datasets\__init__.pytype nul > code\models\__init__.py
-Or one cross-platform command from the repo root:
+---
 
+# Troubleshooting
+
+## `No module named 'code.datasets'`
+
+Make sure these files exist:
+
+```text
+code/__init__.py
+code/datasets/__init__.py
+code/models/__init__.py
+```
+
+They should be empty files.
+
+You can create them from the repository root with:
+
+```bash
 python -c "from pathlib import Path; [Path(p).touch() for p in ['code/__init__.py','code/datasets/__init__.py','code/models/__init__.py']]"
-Notes
-The dataset (Pima Indians Diabetes) is allowed — it is neither CelebFaces nor the smoking-status dataset.
-data/processed/, models/ and mlruns/ are generated by the pipeline and gitignored. The raw CSV is tiny (~25 KB) and can be committed; otherwise Stage 0 downloads it.
-The model served by the API is models/model.joblib; the copies inside mlruns/ are for experiment tracking only.
-If the API logs scikit-learn unpickling warnings, align the scikit-learn version in code/deployment/api/requirements.txt with your local one.
-Grading checklist
-Criterion	Where it is implemented
-Data engineering stage works (1 pt)	code/datasets/prepare_data.py → data/processed/{train,test}.csv
-Model engineering stage works (1 pt)	code/models/train_model.py → MLflow logs, models/model.joblib, models/metrics.json
-Deployment: API + app in separate Docker containers, app displays predictions from the API (1 pt)	code/deployment/ — FastAPI API + Streamlit app via docker-compose.yml
-Complete pipeline automated, runs every 5 min (1 pt)	run_pipeline.py + scheduler.py
-Logical repository structure (1 pt)	follows the recommended layout
+```
+
+---
+
+## `ModuleNotFoundError: No module named 'pandas'`
+
+The virtual environment is probably not activated or the dependencies have not been installed.
+
+Activate the environment and run:
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## MLflow filesystem tracking error
+
+If you see an error related to the filesystem tracking backend, set:
+
+```text
+MLFLOW_ALLOW_FILE_STORE=true
+```
+
+before starting the MLflow UI.
+
+---
+
+## `Untrusted types found: ['sklearn.tree._tree.Tree']`
+
+This is related to MLflow 3.x and `skops`.
+
+The project already handles this through:
+
+```text
+skops_trusted_types=["sklearn.tree._tree.Tree"]
+```
+
+No additional changes should be necessary.
+
+---
+
+## `RuntimeError: Docker Compose not found`
+
+Install Docker Desktop and make sure Docker is running.
+
+---
+
+## Port 8000 or 8501 is already in use
+
+Another application is already using the required port.
+
+Edit:
+
+```text
+code/deployment/docker-compose.yml
+```
+
+For example:
+
+```yaml
+ports:
+  - "8080:8000"
+```
+
+The internal API URL does not need to change because the containers communicate through the Docker Compose network.
+
+---
+
+## PowerShell: running scripts is disabled
+
+If activating the virtual environment produces a PowerShell execution-policy error:
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+Then activate the environment again.
+
+---
+
+## `can't open file 'run_pipeline.py'`
+
+Make sure you are running the command from the repository root:
+
+```text
+assigment_pml1/
+```
+
+Also make sure the file is actually named:
+
+```text
+run_pipeline.py
+```
+
+and not:
+
+```text
+run_pipeline.py.txt
+```
+
+On Windows, enable file-extension display in Explorer if necessary.
+
+---
+
+# Notes
+
+* The Pima Indians Diabetes dataset is used for this assignment.
+* `data/processed/`, `models/`, and `mlruns/` are generated by the pipeline and gitignored.
+* The raw dataset is small (~25 KB) and can be committed to the repository, but Stage 0 can download it automatically if it is missing.
+* `models/model.joblib` is the model actually served by the API.
+* Models stored inside `mlruns/` are used for experiment tracking.
+* If the API reports scikit-learn unpickling warnings, make sure the scikit-learn version in `code/deployment/api/requirements.txt` matches the version used during training.
+
+---
+
+# Assignment Checklist
+
+| Requirement                   | Implementation                     |
+| ----------------------------- | ---------------------------------- |
+| Data engineering stage        | `code/datasets/prepare_data.py`    |
+| Processed train/test datasets | `data/processed/{train,test}.csv`  |
+| Model engineering stage       | `code/models/train_model.py`       |
+| MLflow experiment tracking    | `mlruns/`                          |
+| Saved model                   | `models/model.joblib`              |
+| Evaluation metrics            | `models/metrics.json`              |
+| FastAPI deployment            | `code/deployment/api/`             |
+| Streamlit application         | `code/deployment/app/`             |
+| Separate Docker containers    | `docker-compose.yml`               |
+| Automated pipeline            | `run_pipeline.py` + `scheduler.py` |
+| 5-minute schedule             | `scheduler.py`                     |
+| Repository structure          | Project root and `code/` layout    |
+
+---
+
+## License
+
+This project was created as part of a PMLDL assignment.
