@@ -1,0 +1,30 @@
+services:
+  api:
+    build: ./api
+    container_name: diabetes-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount the models/ folder produced by Stage 2 – the API hot-reloads
+      # the model whenever the pipeline retrains it.
+      - ../../models:/app/models:ro
+    environment:
+      - MODEL_PATH=/app/models/model.joblib
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  app:
+    build: ./app
+    container_name: diabetes-app
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://api:8000
+    depends_on:
+      - api
+    restart: unless-stopped
